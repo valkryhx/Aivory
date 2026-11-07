@@ -98,7 +98,7 @@ if err := store.UpdateDocumentStatus(ctx, s.db, docID, "parsing", "", 0); … //
 
 MinerU 云 API 对接在 `parser.go:653` `minerUExtractViaCloud`,四步:
 
-1. **上传源文件到对象存储**:`PutFileDirect` 直接 S3/OSS 上传,key=`mineru/<short-id>/<safe-name>`,TTL 1 小时(`parser.go:677`、`mineruSourceTTLSeconds=3600`);上传完必删(即使轮询失败也要清理,`parser.go:693`)。
+1. **上传源文件到对象存储**:`PutFileDirect` 直接 S3/OSS 上传,key=`mineru/<short-id>/<safe-name>`,TTL 1 小时(`parser.go:688` 调用点、定义在 `parser.go:1044`（`mineruSourceTTLSeconds`，env `AIVORY_RAG_MINERU_SOURCE_TTLSECONDS`，默认 3600）);上传完必删(即使轮询失败也要清理,`parser.go:693`)。
 2. **提交任务** `POST /api/v4/extract/task`(`parser.go:736`):
 
 ```go
@@ -117,6 +117,9 @@ payload := map[string]any{
 安全要点:zip URL 来自 API 响应,故用 SSRF-safe 客户端(`netsafe.PrivateBlockClient`,`parser.go:868`),且只接受 http(s) scheme、zip 上限 500MiB(`parser.go:892`)。
 
 特殊 chunk:`soleMineruImageMarker`(`rag.go:2755`)——一个刚好等于单个 `![caption](mineru://fname)` 的子块被分类为 `chunk_type="image_caption"` 并记录 `ImageRef`,混合散文的仍是 `text`。
+
+> ⚠️ **但在真实摄取路径上这段代码不可达**：`sanitizeIngestText`（`rag.go:611-617`）会调用 `stripMinerUMarkdownImages`（`parser.go:999`）把 `mineru://` 图片标记全部剥离，而它在 **`rag.go:737` 执行，早于 `rag.go:776` 的 `chunkHierarchical`**。也就是说分块时标记已被清空，`soleMineruImageMarker` 永远匹配不到，**没有任何测试覆盖这条分支**。
+> **复刻提示：不要实现 image-caption 分块器**。把 `image_caption` 视为防御性死代码即可；Python 端若照文档实现，会多写一个永远不触发的图像 caption 管道。
 
 ### 2.4 分块(Chunking,small-to-big)
 
@@ -151,7 +154,7 @@ chunkOverlapChars = 250    // 相邻子块重叠(~12%)
 - **双协议**:OpenAI `/v1/embeddings` 与 DashScope 原生 `text-embedding`(`embedder_http.go:144`、`354`);带 `dimensions` 参数请求,若被 provider 拒绝(400)则**去掉 dim 重试**。
 - **重试/背压**:`postEmbeddings` 指数退避+抖动,重试 TLS 超时/断连/429/5xx,4xx 直接失败;DashScope 有进程级并发槽上限(2,`embedder_http.go:183`)。
 - **维度校准**:嵌入返回的实际维度 ≠ 配置维度时,自动修正 collection 维度并写回 `knowledge_bases.embedding_dim`(`rag.go:901`)。
-- **用量计费**:`logEmbeddingUsage` 记录 embedding 花费(§8.3),本地 embedder 不记账(`embedder_http.go:22`)。
+- **用量计费**:`logEmbeddingUsage`（`rag.go:1070`，⚠️ **不在** `embedder_http.go`）记录 embedding 花费(§8.3),本地 embedder 不记账。
 - **query 嵌入缓存**:进程内 10 分钟/4096 条 TTL 缓存,`embedQueriesCached`(`query_embeddings.go:56`)。
 
 ### 2.6 写入元数据与引用(chunk 行 + Payload)
@@ -208,7 +211,27 @@ ragSlowQueueName = "rag"        // PDF/扫描件慢件,   concurrency=4
 
 - **asynq handler** `handleAsynqIngest`(`rag.go:437`):解 `doc_id` → `runIngestWithRetries`。业务/上游失败已在其内部处理并归档,故 handler 出错只包 `asynq.SkipRetry`(保留 asynq 重试给**租约丢失**,不把"3 次管线重试"再叠一层,`rag.go:453`)。
 - **DB 心跳** `startIngestHeartbeat`(`rag.go:525`):每 30 秒 `TouchDocumentIngest` 刷新 `documents.ingest_updated_at`(`store/kbs.go:1283`),**只在非终态**写,避免迟到心跳让 ready/failed 复活。
-- **向量写租约** `upsertDocumentVectors`(`rag.go:17`)+ `BeginDocumentVectorWrite`(`store/resource_lifecycle.go:67`):写向量前先 `UPDATE documents SET id=id WHERE id=?` 锁行 + 插 `document_vector_writes(write_id, document_id, expires_at)`;事务在网络 I/O 前结束,慢 Qdrant 不会占住 SQLite 写锁。删除侧以租约未过期作为"清理尚未安全"信号。
+- **向量写租约** `upsertDocumentVectors`（`vector_lifecycle.go:17`，⚠️ **不在** `rag.go`）+ `BeginDocumentVectorWrite`(`store/resource_lifecycle.go:67`):写向量前先 `UPDATE documents SET id=id WHERE id=?` 锁行 + 插 `document_vector_writes(write_id, document_id, expires_at)`;事务在网络 I/O 前结束,慢 Qdrant 不会占住 SQLite 写锁。删除侧以租约未过期作为"清理尚未安全"信号。整段写入包在 `vectorWriteTimeout`（**2 分钟**）租约内——复刻时这个超时值必须一致，否则慢向量库会导致租约提前失效。
+
+#### 3.2.1 摄取流水线的全部可调参数（`rag.go:43-63`，全部 `envcfg` 可覆盖）
+
+复刻时这张表要逐个对齐，否则崩溃恢复与租约语义会漂移：
+
+| 变量名 | 默认值 | 作用 |
+|---|---|---|
+| `ragFastQueueConcurrency` / `ragSlowQueueConcurrency` | 4 / 4 | 两条 asynq lane 的并发度 |
+| `ingestPipelineTimeout` | 70 min | 单次摄取管线总超时 |
+| `ingestTaskTimeout` | 75 min | asynq 任务超时（略大于管线） |
+| `ingestUniqueTTL` | 80 min | asynq `Unique` 唯一锁 TTL |
+| `ingestHeartbeatInterval` | 30 s | 心跳写 `ingest_updated_at` 的间隔 |
+| **`ingestStaleAfter`** | **4 min** | 心跳停滞多久算"任务已死"（看门狗认领阈值） |
+| `ingestPendingStaleAfter` | = `ingestUniqueTTL` | pending 态的特殊陈旧阈值 |
+| `ingestRecoveryInterval` | 1 min | 看门狗扫描周期 |
+| `ingestFinalizeTimeout` | 30 s | 收尾阶段超时 |
+| `ingestAsynqLeaseMaxRetries` / `ingestAsynqRetryDelay` | 1 / 2 min | 仅"租约丢失"才重试 |
+| `runIngestMaxAttempts` / `runIngestRetryBackoff` | 3 / 3 s | 管线内部重试次数与退避基数 |
+
+> 另注：map-reduce 摘要的 asynq task kind 是 **`task.rag_map_reduce`**（`rag.go:4190`），别只在文档层面描述"map-reduce"却不实现这个 task 名——asynq 侧按字符串匹配。
 
 ### 3.3 崩溃恢复(RequeueIncomplete / RunIngestRecovery / RequeueStaleIngests)
 
@@ -241,7 +264,7 @@ type Store interface {
 }
 ```
 
-**`Scope` 隔离**(`vector.go:50`):`KBIDs + ConversationID + DocumentIDs`,语义为"kb_id ∈ KBIDs OR conversation_id = ConvID;DocumentIDs 提供时替换 Conversation 分支"。这是**租户/会话隔离**的唯一手段——检索时据此过滤。
+**`Scope` 隔离**（`vector.go:52`）:`KBIDs + ConversationID + DocumentIDs`,语义为"kb_id ∈ KBIDs OR conversation_id = ConvID;DocumentIDs 提供时替换 Conversation 分支"。这是**租户/会话隔离**的唯一手段——检索时据此过滤。
 
 **`Enabled()` 为 false**(Disabled 存储)时,RAG 层退化为**全上下文注入**(见 `rag.go:1263` fullContext 逻辑)。
 
@@ -261,7 +284,7 @@ type Store interface {
 
 个人单实例部署:无守护进程、无原生扩展,精确余弦搜索进程内完成。
 
-- **存储**:表 `vector_points(chunk_id, dimension, embedding)`;embedding 为 **L2 归一化后的 float32 LE 字节** 序列(`encodeNormalizedVector`,`sqlite.go:407`);upsert `ON CONFLICT(chunk_id,dimension) DO UPDATE`(`sqlite.go:41`)。
+- **存储**:表 `vector_points(chunk_id, dimension, embedding)`;embedding 为 **L2 归一化后的 float32 LE 字节** 序列(`encodeNormalizedVector`,`sqlite.go:407`);upsert `ON CONFLICT(chunk_id,dimension) DO UPDATE`（`sqlite.go:26` 函数，`:44` 冲突子句）。
 - **检索** `Search`(`sqlite.go:67`):`JOIN chunks` 取 scope 内全部向量 → 内存 `dotProduct`(归一化后即余弦,`sqlite.go:457`)→ **exact topK**。
 - **关键词腿** `SearchKeyword`(`sqlite.go:130`):**刻意不用 FTS5**,用内存词频 `sqliteKeywordScore`(`sqlite.go:477`,大小写归一、子串含 term +1),保证个人镜像 amd64/arm64 行为一致、无原生扩展依赖。
 - **状态/清理**:`VectorChunkStatuses` 用 `length(embedding)==dim*4` 判向量是否为空(`sqlite.go:255`);删除用 `DELETE FROM vector_points WHERE chunk_id IN (SELECT … FROM chunks WHERE field=?)`(`sqlite.go:272`)。
@@ -336,7 +359,13 @@ type Snippet struct {
 - **路由 prompt** `buildRouterPrompt`(`rag.go:4225`):列出在作用域文档 metadata(可信)+ 最新用户消息 + `rag.router.rules` 系统提示;决策输出 `RouteDecision{strategy: none|retrieve|full_doc, document_ids, queries}`(`rag.go:2777`)。
 - **TaskLLM 调用**:优先 `DocumentRouter.RouteDocuments`(类型化路径),否则 `task.RunJSON("task.router", …)`(`rag.go:3094`);12s 超时(`routerCallTimeout`),失败回退 plain retrieve。
 - **full_doc** 超预算 → **map-reduce 摘要** `mapReduceSummarise`(`rag.go:4133`):按 ~6000 token/组、最多 8 组分批,每组 `rag.map_reduce.input` prompt 让 TaskLLM 出 ≤200 字符摘要,绝不跨文档合并进单条引用。
-- **迭代证据扩展** `RouteAndRetrieveIterative`(`rag.go:3218`):首轮(命中检索判定足够)即返回;否则 `rag_evidence_judge` **判据模型**(`judgeIterativeEvidence`,`rag.go:3641`,`task.rag_evidence_judge`)给出 `sufficient? queries?`,用 follow-up 查询再检索扩证,最多 3 条新 query、24 候选,直至证据充分或无新片段。判据 prompt 构造于 `buildEvidenceJudgePrompt`(`rag.go:3660`)。状态机:`found | partial | no_hit | error`(`rag.go:2789`)。
+- **迭代证据扩展** `RouteAndRetrieveIterative`(`rag.go:3218`):首轮(命中检索判定足够)即返回;否则 `rag_evidence_judge` **判据模型**(`judgeIterativeEvidence`,`rag.go:3641`,`task.rag_evidence_judge`)给出 `sufficient? queries?`,用 follow-up 查询再检索扩证,直至证据充分或无新片段。判据 prompt 构造于 `buildEvidenceJudgePrompt`(`rag.go:3660`)。状态机:`found | partial | no_hit | error`(`rag.go:2789`)。
+  > **三个上限别混淆**（`rag.go:2834-2839`）：
+  > - `iterativeMaxFollowUpQueries = 3` —— 每轮最多几条 follow-up 查询
+  > - `iterativeMaxCandidates = 12` —— **每轮候选池上限**（不是 24）
+  > - `iterativeJudgeMaxQueries = 24` —— 判据模型**总共**最多可产出多少条 query
+  >
+  > 复刻时按 3 / 12 / 24 三个独立常量实现。另注：`reranker.go:22` 的 `rerankCandidateLimit = 24` 是**重排**的候选上限，与迭代检索无关。
 
 ---
 

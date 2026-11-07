@@ -1,7 +1,7 @@
 # Aivory 后端调研 01：HTTP API 路由层 + 认证授权系统
 
 > 目标：深度复刻 Aivory 的 Go 后端（后端换成 Python/FastAPI）。本文聚焦 **Go 后端 HTTP API 路由层 + 认证授权系统**，为 FastAPI 复刻提供协议/字段/时序级参考。
-> 源码根：`D:\git_codes\Aivory\server`
+> 源码根：`d:\git_repos\Aivory\server`
 > 涉及包：`internal/api`（router/middleware/handlers）、`internal/auth`（JWT/TOTP）、`internal/oauth`（OAuth 提供商）、`internal/store/refresh_tokens.go`（会话持久化）。
 
 ---
@@ -9,8 +9,8 @@
 ## 0. 架构总览
 
 - 后端是一个**单二进制 Go 进程**，使用**标准库 `net/http` + 手写微型 mux**（`internal/api/mux.go`），刻意不引入 gin/echo 等路由框架，减少依赖面。
-- 所有路由统一在 `NewRouter(d Deps) http.Handler`（`router.go:145`）中注册，共 **441 条** `mux.handle(...)` 调用（`grep -c` 验证）。
-- 依赖通过 `Deps` 结构体（`router.go:35`）注入：DB（`*sql.DB`）、Cache（Redis/内存抽象）、Auth（JWT service）、Queue、Mailer、LLM Provider、RAG、Passkey service、Logger 等。
+- 所有路由统一在 `NewRouter(d Deps) http.Handler`（`router.go:149`）中注册，共 **443 条** `mux.handle(...)` 调用（`grep -c` 验证；其中 `/api/admin/*` 前缀 202 条）。
+- 依赖通过 `Deps` 结构体（`router.go:35`）注入：DB（`*sql.DB`）、Cache（Redis/内存抽象）、Auth（JWT service）、Queue、Mailer、LLM Provider、RAG、Passkey service、Logger 等。**v2.5.2-beta.12 之后新增字段** `SkillImportHTTPClient *http.Client`（`router.go:63-66`）——仅供测试注入，生产留 `nil`，走 SSRF 加固的 `netsafe` 客户端。
 - **鉴权模型**：短时效 access JWT（cookie `auth_token` 或 `Authorization: Bearer`）+ 长时效 refresh JWT（HttpOnly cookie `refresh_token`，Path 限定 `/api/auth`），配合数据库中 `refresh_tokens` 表做会话持久化、旋转与撤销。
 - **分层中间件链**（从外到内）：`errorResponseLoggingMiddleware` → `recoverMiddleware` → `spaHandler`(可选) → `corsMiddleware` → `siteAccessMiddleware` → 自定义 mux → 路由级包装器(`rateLimitedIP`/`requireAuth`/`requireAdmin`)。
 
@@ -23,7 +23,7 @@
 自定义 mux（`mux.go:36-108`）：
 - `mux.handle(method, pattern, handler)`：`pattern` 使用 `:name` 路径参数语法，拆分为段数组。
 - `matchPath`：逐段匹配；`:` 前缀段为参数，写入 `r.Context()`（`pathCtxKey`），处理器用 `pathParam(r, "name")` 读取。
-- **首次匹配原则**（`ServeHTTP` 逐条线性扫描）：静态路由需注册在 `/:id` 前，否则会被吞（如 `/api/admin/models/reorder` 必须早于 `/api/admin/models/:id`，见 `router.go:537-540`、`router.go:601-602` 注释）。
+- **首次匹配原则**（`ServeHTTP` 逐条线性扫描）：静态路由需注册在 `/:id` 前，否则会被吞（如 `/api/admin/models/reorder` 必须早于 `/api/admin/models/:id`，见 `router.go:541-544`、`router.go:607-608` 注释）。
 - 方法不匹配记下 pattern 后继续扫描，最终 404 JSON `{"error":"not found"}`。
 - 请求命中后调用 `auditHTTPRequest(d, w, r, handler)`（在 mux 层做审计，见 4.4）。
 - `writeJSON`/`writeError` 统一 JSON 响应；`writeError` 对 5xx 落到客户端只返回 `"internal server error"`，真实错误仅写日志（`mux.go:117-132`）。
@@ -31,7 +31,7 @@
 
 ### 1.2 按资源分组的端点
 
-> 方法/路径/用途/是否鉴权。441 条不逐条罗列，按资源分组概括 + 标出代表性关键端点。鉴权列：🔓=公开、🔒=requireAuth、🛡=requireAdmin、⏱=额外 IP 限流。
+> 方法/路径/用途/是否鉴权。443 条不逐条罗列，按资源分组概括 + 标出代表性关键端点。鉴权列：🔓=公开、🔒=requireAuth、🛡=requireAdmin、⏱=额外 IP 限流。
 
 #### A. 认证核心（`/api/auth/*`）— 公开凭据面，全部强制 IP 限流
 | 方法/路径 | 用途 | 鉴权 |
@@ -115,6 +115,7 @@
 - user-groups、credit-packages、payment-channels、payment-methods、payment-orders。
 - users（CRUD/ban/unban/password/email/role/2fa disable、drill-down conversations/projects/memories/login-history/images/kbs）、conversations、domains、workspaces。
 - resources、usage、tool-logs、audit-logs、analytics、overview、feedback、files。
+- skills（CRUD/reorder/assets；**v2.5.2-beta.12 之后新增** `POST /api/admin/skills/import-archive`（`router.go:596`，上传 zip）与 `POST /api/admin/skills/import-remote`（`router.go:597`，传 URL），实现见 `admin_skill_import.go`（761 行）——只返回预览、不写 `skills` 表，详见《技能与MCP分级分析》§5.5）。
 - oauth-providers（CRUD/prepare/reorder）、settings、system-prompts、email/preview。
 - aippt、backup（export/import/archives/import-jobs）、config export/import、vectors、redeem-codes、icons。
 - `requireAdmin` 内部先 `requireAuth` 再判 `u.Role == "admin"`（`middleware.go:166`）。
@@ -123,7 +124,7 @@
 
 ## 2. 中间件链与请求生命周期
 
-### 2.1 外层组装顺序（`router.go:754-758`）
+### 2.1 外层组装顺序（`router.go:760-764`）
 
 ```go
 var handler http.Handler = corsMiddleware(d.Config.AllowedOrigins, siteAccessMiddleware(d, mux))
@@ -135,9 +136,9 @@ return errorResponseLoggingMiddleware(d.Logger, recoverMiddleware(handler))
 
 请求进入顺序（从外到内）：
 1. **errorResponseLoggingMiddleware**（`response_logging.go:274`）——最外层，用 `responseLogWriter` 包装 ResponseWriter，记录非 2xx 的 method/route/status/duration/reason；成功响应体和 SSE/文件下载**不缓冲**。为实现 SSE 的 `Flusher`、WebSocket 的 `Hijacker`、HTTP/2 的 `Pusher`、文件的 `ReaderFrom`，它按底层 ResponseWriter 能力动态选择组合包装类型（`responseLogF/H/P/R` 组合矩阵，`response_logging.go:212`）。
-2. **recoverMiddleware**（`router.go:815`）——捕获 handler panic，记录堆栈，回 500，不崩进程。
-3. **spaHandler**（`router.go:771`）——仅当配置了 `STATIC_DIR`（单容器部署前后端同源）。非 `/api/*` 路径：存在的真实文件按 `Cache-Control` 策略服务（`/assets/*` 永久缓存、`index.html/version.json/sw.js` 禁止缓存、public 文件 must-revalidate）；缺失的 `/assets/*` 回 404（不吞掉旧 chunk）；其它未知路径回退 `index.html`（SPA 路由）。`path.Clean` 防目录穿越。
-4. **corsMiddleware**（`router.go:830`）——**回显式 CORS**：只有 `Origin` 精确命中 `AllowedOrigins` 配置才回 `Access-Control-Allow-Origin: <origin>` + `Allow-Credentials: true`（credentials 模式不能用 `*`）。`Allow-Headers` 明确列出签名字段等自定义头；`Allow-Methods: GET,POST,PATCH,PUT,DELETE,OPTIONS`；`Max-Age: 600s`。OPTIONS 直接回 204。
+2. **recoverMiddleware**（`router.go:821`）——捕获 handler panic，记录堆栈，回 500，不崩进程。
+3. **spaHandler**（`router.go:777`）——仅当配置了 `STATIC_DIR`（单容器部署前后端同源）。非 `/api/*` 路径：存在的真实文件按 `Cache-Control` 策略服务（`/assets/*` 永久缓存、`index.html/version.json/sw.js` 禁止缓存、public 文件 must-revalidate）；缺失的 `/assets/*` 回 404（不吞掉旧 chunk）；其它未知路径回退 `index.html`（SPA 路由）。`path.Clean` 防目录穿越。
+4. **corsMiddleware**（`router.go:836`）——**回显式 CORS**：只有 `Origin` 精确命中 `AllowedOrigins` 配置才回 `Access-Control-Allow-Origin: <origin>` + `Allow-Credentials: true`（credentials 模式不能用 `*`）。`Allow-Headers` 明确列出签名字段等自定义头；`Allow-Methods: GET,POST,PATCH,PUT,DELETE,OPTIONS`；`Max-Age: 600s`。OPTIONS 直接回 204。
 5. **siteAccessMiddleware**（`site_access.go:94`）——站点整体关闭开关（`site_access` 设置）。`/api/auth/*`（除 register）、支付回调和一批 public 端点豁免；管理员在关闭时放行；普通用户回 503 `{error:"site_closed", closed:true, message}` + `Retry-After: 30`。
 6. **自定义 mux** —— 命中路由 → `auditHTTPRequest` → 路由级包装器（见下）。
 
@@ -241,7 +242,7 @@ type RefreshClaims struct {
 - 改密/重置 → token_ver +1 → 所有该用户旧 access/refresh 因 `TV` 不匹配全部失效。
 - 会话管理端点：`GET /api/auth/sessions` 列活跃会话、`POST revoke-others`、`POST /:jti/revoke`（当前族由 access-token `sid` 或 refresh cookie 推导，浏览器/Bearer 语义一致）。
 
-**Cookie 细节**（`auth_handlers.go:912-1033`）：
+**Cookie 细节**（`auth_handlers.go:912-1044`）：
 - `auth_token`：HttpOnly、Path `/`、SameSite=Lax、Secure 视连接（`secureCookie` 判断 TLS 或受信代理 `X-Forwarded-Proto`）。
 - `refresh_token`：HttpOnly、**Path `/api/auth`**（只随 auth 端点发送）、SameSite=Lax。
 - 清 cookie 时按 `auth_token` 的 `/`、`/api`、`/api/auth` 三种旧 Path 变体都清，防旧 cookie 遮蔽。
@@ -326,7 +327,7 @@ type RefreshClaims struct {
 - `rateLimitUser`：**per-USER**，key：`rl:u:<scope>:<userID>`（用于耗敏的已认证操作，如文档上传）。
 - `reserveConcurrentGen`：每用户**并发生成槽位**（默认 cap=3，可 `max_concurrent_generations` 覆盖），`gen:active:<uid>` Incr，超限 Decr 回退并拒绝（并发聊天生成限制）。
 
-### 6.2 各接口限流预算（`router.go:69-142`，均可用 `AIVORY_API_RATE_LIMIT_*` 覆盖）
+### 6.2 各接口限流预算（`router.go:73-145`，均可用 `AIVORY_API_RATE_LIMIT_*` 覆盖）
 | 接口 scope | 预算（次/窗口） |
 |---|---|
 | auth register | 5 / 60s |
@@ -355,7 +356,7 @@ type RefreshClaims struct {
 | private-chat | 30 / min |
 | conversation pdf | 12 / min |
 
-另有：**per-IP 每日注册配额** `register_ip_daily_limit`（`auth_handlers.go:322`，失败回滚）；**每日 token 配额** `daily_token_limit`（`middleware.go:439`，基于持久化计费账本）。
+另有：**per-IP 每日注册配额** `register_ip_daily_limit`（`auth_handlers.go:326`，失败回滚）；**每日 token 配额** `daily_token_limit`（`middleware.go:439`，基于持久化计费账本）。
 
 ### 6.3 v2 请求签名（`middleware.go:464-629`）
 可选启用（`RequestSignaturesRequired`）。浏览器为每个已认证请求附加头：
@@ -363,8 +364,9 @@ type RefreshClaims struct {
 
 HMAC 消息（以 `\x00` 连接）：
 ```
-v2 \x00 ts \x00 nonce \x00 METHOD \x00 canonicalTarget \x00 deviceId \x00 payloadDigest \x00 sha256(rawToken)
+v2 \x00 ts \x00 nonce \x00 METHOD \x00 canonicalTarget \x00 deviceId \x00 payloadDigest \x00 hex(sha256(rawToken))
 ```
+> ⚠️ 最后一段**不是裸的 32 字节 digest，而是 64 字符小写 hex 字符串**——`requestAccessTokenDigest`（`middleware.go:523-526`）先 `sha256.Sum256` 再 `hex.EncodeToString`，该**字符串**参与 `\x00` 拼接。复刻时若在 Python 里直接 join 了 `bytes`，签名必然对不上，表现为所有已认证请求 401。
 - key：由会话 `RequestSigningKey(sessionID)` 派生（HMAC(requestKey, "aivory/request-proof/session/"+sid)，base64url），**与 JWT 签名密钥分离，且不出现在 access token 内**（复制 Authorization 不足以铸签名）。
 - 双重 HMAC：先用 `requestKey` 签 `ts/3600`（小时键）作 base，再签消息。
 - 时间窗：±60s~+300s（可配）防重放；nonce 用 `Cache.SetNX(reqnonce:<uid>:<sid>:<nonce>, ttl)` **原子消费**，跨副本字节级重放即拒绝。
@@ -378,7 +380,7 @@ v2 \x00 ts \x00 nonce \x00 METHOD \x00 canonicalTarget \x00 deviceId \x00 payloa
 - **请求体 4MB** 上限、错误日志不外泄内部细节（`mux.go:117-132`）。
 - **CORS 回显式** + 明确允许签名字段。
 - `security_config.go`、`domain_access.go`（企业域名白名单）、`admin_audit_middleware.go`（审计/离线审计日志）。
-- `clientIP` 防 XFF 伪造；OAuth 端点经 `ValidateHTTPSProviderEndpoint` + DNS-rebinding-safe client + 禁重定向（`oauth.go:116-122`）。
+- `clientIP` 防 XFF 伪造；OAuth 出站安全分两处实现：硬化 HTTP 客户端 `genericOAuth2HTTPClient`（`oauth.go:119-124`，DNS-rebinding-safe + 禁重定向）与端点校验 `ValidateHTTPSProviderEndpoint`（`oauth.go:582`）。
 
 ---
 
@@ -467,7 +469,7 @@ async def get_current_user(request: Request, db=Depends(get_db),
 ---
 
 ## 附录：关键文件索引
-- `server/internal/api/router.go` — 441 条路由、限流预算、中间件组装、CORS、SPA
+- `server/internal/api/router.go` — 443 条路由、限流预算、中间件组装、CORS、SPA
 - `server/internal/api/mux.go` — 手写微型路由
 - `server/internal/api/middleware.go` — requireAuth/requireAdmin/CSRF/限流/请求签名/clientIP
 - `server/internal/api/response_logging.go` — 响应日志 / ResponseWriter 能力矩阵

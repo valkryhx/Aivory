@@ -34,12 +34,16 @@
 | `sandbox` | `aivory-sandbox-sidecar`：挂载宿主 `docker.sock`，为每个会话 `docker run` 锁定的 `aivory-sandbox` 运行时；env：`SANDBOX_MEMORY`(2g)、`SANDBOX_CPUS`、`SANDBOX_MAX_SESSIONS`(16)、`SANDBOX_EXEC_TIMEOUT_CAP_MS`(600000)、`SANDBOX_READ_ONLY_ROOTFS=1`、`SANDBOX_WORKSPACE_SIZE`(512m)、`SANDBOX_LOCAL_STORAGE_DIR`(workspace 归档卷 sandbox-archives) |
 | `sandbox-image-keepalive` | 防止运行时镜像被 `docker image prune` 回收 |
 | `updater` | `aivory-updater`（Python，见 §4） |
-| `app` | `aivory-app`：端口 **`80:8787`**；env `AIVORY_LISTEN=:8787`、`SANDBOX_URL` 等 |
+| `app` | `aivory-app`：端口 **`80:8787`**；env `AIVORY_LISTEN=:8787`、**`SANDBOX_BASE_URL`**（`docker-compose.prod.yml:248`，值 `http://sandbox:8000`，配套 `SANDBOX_API_KEY`）等 |
+
+> ⚠️ 环境变量名是 **`SANDBOX_BASE_URL`**，不是 `SANDBOX_URL`——后者在整个仓库中不存在。Go 端在 `config/config.go:125` 读取它。Python 端若读 `SANDBOX_URL`，配置不会生效。
 
 网络：内部 `internal` 网络隔离（仅 app 对外暴露 80）。
 
 ### 2.2 个人版（`docker-compose.personal.yml`）
-仅 `app`、`sandbox`(+keepalive)、`updater`、归档卷。**单一 app 实例跑 SQLite**（`bun` 内嵌向量，无需 PG/Redis/Qdrant），零外部依赖。
+默认只起 **`app` + `updater`** 两个服务（文件头 `:2-9` 明确说明）。`sandbox` 与 `sandbox-image-keepalive` 都在 **`profiles: ["sandbox"]`** 门控下（`:85`、`:118`），**必须显式 `docker compose --profile sandbox up -d`** 才会启动；默认 `up -d` 不会挂载 `docker.sock`。
+
+个人版 `app` 用 **SQLite 单实例**，向量也是内嵌在同一个关系库里的精确余弦检索（`server/internal/vector/sqlite.go:15-23`，注释明确 "no daemon or native SQLite extension is required"），**没有 `bun` 依赖**，无需 PG/Redis/Qdrant。
 
 ### 2.3 外部依赖与 `ALLOWED_ORIGINS`
 - 生产需 `POSTGRES_PASSWORD`、`REDIS_PASSWORD`、`JWT_SECRET` 强值；个人版仅 `JWT_SECRET`。
@@ -51,7 +55,7 @@
 
 | 工作流 | 职责 |
 |---|---|
-| `docker-images.yml` | 构建并推送 `aivory-app`（含前端+后端）镜像到 GHCR |
+| `docker-images.yml` | 构建并推送**两个**镜像到 GHCR（`.github/workflows/docker-images.yml:55-62` 的 matrix）：`aivory-app`（`deploy/Dockerfile.app`）与 `aivory-updater`（`updater/Dockerfile`），两者均为 amd64 + arm64（`:45`） |
 | `sandbox-image.yml` | 构建/推送 `aivory-sandbox`（运行时）与 `aivory-sandbox-sidecar` 镜像 |
 | `desktop.yml` | 桌面客户端构建/测试/发布 |
 
@@ -66,13 +70,20 @@
 - **角色**：一个常驻小 HTTP 服务，从 **Admin → 更新控制** 接收指令，通过读写 `docker-compose.prod.yml` / `.env` 触发 `docker compose pull && up -d` 完成应用升级；也顺带更新「正在运行的捆绑 sandbox」源码。
 - **关键机制**：
   - 监听 `AIVORY_UPDATER_LISTEN`（默认 `0.0.0.0:8790`）。
-  - 鉴权：HS256 token，token 文件 `AIVORY_UPDATER_TOKEN_FILE`（`/shared/.aivory-update-token`），与应用容器共享密钥（Go 端 `system-update.ts` / `desktop-update.ts` 与更新器对接）。
+  - 鉴权：**不透明静态 bearer token，不是 JWT**。启动时用 `secrets.token_urlsafe(48)` 生成（`updater.py:82`）写入 token 文件 `AIVORY_UPDATER_TOKEN_FILE`（`/shared/.aivory-update-token`），校验用 `hmac.compare_digest`（`updater.py:409-411`）。`updater/` 里没有任何 JWT 代码——HS256 是**应用自身**的登录 JWT（`auth/auth.go:128,153`），与该更新器无关。Go 端调用方是 `server/internal/api/admin_system_update.go:293` 的 `callSystemUpdater`。
   - 配置驱动：`AIVORY_UPDATER_COMPOSE_FILE`、`AIVORY_UPDATER_ENV_FILE`、`AIVORY_UPDATER_APP_SERVICE`（默认 `app`）。
-  - 拉取指定 `IMAGE_TAG` 的镜像 → health 检查（`AIVORY_UPDATER_HEALTH_TIMEOUT_SECONDS` 默认 180s）→ 回滚保护。
+  - 更新时写入的是 **`APP_IMAGE_TAG`**（`updater.py:342`），沙箱源码指纹变化时另写 `SANDBOX_IMAGE_TAG`（`:344`）；若目标 compose 文件不支持这些变量则**硬失败**（`:347,352`）。**不是** `IMAGE_TAG`。
+  - 拉取镜像 → health 检查（`AIVORY_UPDATER_HEALTH_TIMEOUT_SECONDS` 默认 180s）→ 回滚保护（回滚时恢复 `.env`，并按**镜像 ID** 以 `pull_policy: never` 重新拉起上一版，`:366-385`）。
+  - HTTP 端点：`GET /healthz`（免鉴权）、`GET /v1/status`、`POST /v1/update`（body `{"version": ...}`，≤4096 字节，成功 202 / 冲突 409）；版本号走严格 semver 正则（`updater.py:30-33`）。
   - `sandbox_sources.py`（48 行）：`source_fingerprint` 计算捆绑沙箱运行时源码指纹，用于决定是否需要重建/更新 sandbox 镜像。
 - `test_updater.py`（278 行）：标准库 `unittest` 单测。
 
-> **Python 替换提示**：`updater/` 与语言无关（只操作 compose/镜像），**可直接复用**驱动新的 Python 后端容器升级；无需重写。
+> ⚠️ **「updater 语言无关，可直接复用」这个结论是错的**，这是本文档最容易在无声中故障的一条。`_sandbox_plan`（`updater.py:209-239`）要求**应用镜像本身**带有 `io.aivory.sandbox.source=<64 hex>` 标签（或等价的 OCI source+revision 标签），否则直接抛 "sandbox image lacks source metadata"。因此把 `aivory-app` 换成 Python 镜像时，**新镜像必须打上同样的标签**（官方 CI 由 `.github/workflows/docker-images.yml:119` 通过 `updater/sandbox_sources.py` 注入），并且：
+> - compose 里的服务名必须保持 `sandbox` / `sandbox-image-keepalive`；
+> - 需要挂载 `docker.sock`；
+> - 需要 `${DATA_DIR}:/shared` 卷。
+>
+> 漏掉任何一条，自动更新会**静默失效**（不是报错退出），排查成本很高。
 
 ---
 
@@ -84,7 +95,7 @@
 |---|---|---|
 | postgres/redis/qdrant | 否 | FastAPI 通过 `asyncpg`+`redis-py`+`qdrant-client` 连接 |
 | sandbox (sidecar) | **否** | 已是 Python/FastAPI，HTTP 契约不变 |
-| updater | 否 | 语言无关 |
+| updater | **需打标** | 代码本身语言无关可复用，但**新镜像必须带 `io.aivory.sandbox.source` 标签**，且 compose 服务名/`docker.sock`/`/shared` 卷保持不变 —— 见 §4 的警告 |
 | app 镜像 | **改** | 换成 Python 镜像；`STATIC_DIR` 改由 FastAPI `StaticFiles` 服务；env 命名尽量对齐 |
 | 健康检查 | 改 | `/api/health` 由 FastAPI handler 提供（契约不变） |
 | 端口 | 不变 | 容器内 8787（FastAPI/uvicorn `--port 8787`），对外 80 |

@@ -174,13 +174,13 @@ type ToolDef struct {
 
 | 工具名 | 注册位置 | 用途 | InputSchema |
 |---|---|---|---|
-| `aivory_web_search` | `builtins.go:156`（`webSearchTool`） | 联网搜索（可批量、可搜图） | `registry.go` 里动态拼，见下 |
+| `aivory_web_search` | `builtins.go:112`（`webSearchTool`，struct 在 :107） | 联网搜索（可批量、可搜图） | `registry.go` 里动态拼，见下 |
 | `web_fetch` | `builtins.go:367`（`webFetchTool`） | 抓取网页正文 + 图片元数据，SSRF 防护 + Jina 兜底 | `{"type":"object","properties":{"url","urls","show_images"}}` |
 | `fetch_image` | `builtins.go:768` | 下载公开图片进沙箱 `/workspace/downloads/` | `{"type":"object","properties":{"url","filename"},"required":["url"]}` |
 | `python_execute` | `builtins.go:1186` | 在持久 Python 沙箱跑代码（数学/数据分析/图像编辑/绘图/文档编辑/生成下载文件） | `{"type":"object","properties":{"code":{"type":"string","minLength":1}},"required":["code"]}` |
-| `image_generate` | `builtins.go:1757` | 图生图 / 文生图（Gemini / OpenAI 双通道） | `{"type":"object","properties":{"prompt","action","base_image","base_image_index","n","size"},"required":["prompt","action","base_image"]}` |
-| `use_skill` | `builtins.go:3660` | 加载已注册技能的完整说明 | `{"type":"object","properties":{"name"},"required":["name"]}` |
-| `save_memory` | `builtins.go:3752` | 持久化用户长期记忆 | `{"type":"object","properties":{"memory_text","slot","value"},"required":["memory_text"]}` |
+| `image_generate` | `builtins.go:1765` | 图生图 / 文生图（Gemini / OpenAI 双通道） | `{"type":"object","properties":{"prompt","action","base_image","base_image_index","n","size"},"required":["prompt","action","base_image"]}` |
+| `use_skill` | `builtins.go:3668` | 加载已注册技能的完整说明 | `{"type":"object","properties":{"name"},"required":["name"]}` |
+| `save_memory` | `builtins.go:3760` | 持久化用户长期记忆 | `{"type":"object","properties":{"memory_text","slot","value"},"required":["memory_text"]}` |
 
 ### 2.1 web_search 的动态 schema（值得注意）
 
@@ -197,13 +197,13 @@ const (
 
 ### 2.2 image_generate（最复杂的内置工具）
 
-`imageGenerateTool.Execute`（`builtins.go:1832-2163`）体现了工具分层鉴权 + 计费 + 配额 + 内容安全 + 多通道 fallback 的完整模式：
+`imageGenerateTool.Execute`（`builtins.go:1840-2171`）体现了工具分层鉴权 + 计费 + 配额 + 内容安全 + 多通道 fallback 的完整模式：
 - 解析并严格校验输入（action/base_image/base_image_index、尺寸合规、n 上限）。
-- `resolveImageModel`（`builtins.go:2185`）：用用户预选 image 模型或第一个启用 image 模型。
-- **内容安全**：`moderateImagePrompt`（`builtins.go:2002`）对最终 provider prompt 做自查。
-- **配额/计费**：每日图片限额（`checkDailyImageLimit`，`quota_ledger` 原子预留）、每模型 quota、`ImageBilling`（free→credits→block，`builtins.go:1941-1975`）。
-- **双通道**：`geminiGenerateImages` / `openaiGenerateImages`（`builtins.go:2043-2050`），按 channel type 路由；主通道失败走 `resolveImageFallbackChannels` 逐个兜底（`builtins.go:2065-2082`）。
-- **持久化**：`saveArtifact` 写 ArtifactDir + 记录 artifact 行 + `tc.OnArtifact` 回调触发 SSE `artifact` 事件（`builtins.go:1561-1623`）。
+- `resolveImageModel`（`builtins.go:2193`）：用用户预选 image 模型或第一个启用 image 模型。
+- **内容安全**：`moderateImagePrompt`（定义 `builtins.go:2409`，调用 `builtins.go:2010`）对最终 provider prompt 做自查。
+- **配额/计费**：每日图片限额（`checkDailyImageLimit`，`quota_ledger` 原子预留）、每模型 quota、`ImageBilling`（free→credits→block，`builtins.go:1947-1983`）。
+- **双通道**：`geminiGenerateImages` / `openaiGenerateImages`（`builtins.go:2051-2058`），按 channel type 路由；主通道失败走 `resolveImageFallbackChannels` 逐个兜底（`builtins.go:2073-2090`）。
+- **持久化**：`saveArtifact` 写 ArtifactDir + 记录 artifact 行 + `tc.OnArtifact` 回调触发 SSE `artifact` 事件（`builtins.go:1569-1631`）。
 
 > Python 复刻：image_generate 的**分层鉴权/配额逻辑与工具本体解耦**，建议复刻时把「加载模型 → 配额预检 → 内容安全 → 调 provider → fallback → 计费/持久化」做成可复用的管线，装饰器只做 schema 定义。
 
@@ -261,15 +261,16 @@ POST {BaseURL}/files/reset-inputs {session_id}
 
 - `ErrSessionGone`（`sandbox.go:42`）：sidecar 空闲回收器已删掉会话。`python_execute` 视为**预期恢复信号**：重建会话 + 重新 staging 权威输入 + 重试一次。
 - `isSandboxSessionRecoverable`：基于 `HTTPError.StatusCode==404`（`archive_browser.go:28-44` 的 `IsSessionGone`，识别 `session not found` / `session not running`）。
-- `python_execute.Execute`（`builtins.go:1198-1477`）完整流程：
+- `python_execute.Execute`（`builtins.go:1198-1486`）完整流程：
   1. 读 `sandbox_id`（`store.GetConvProviderStateKey`）；
   2. 没有则 `NewSession(ctx, convID)`（archiveKey=会话id=会话ID，稳定键归档），并持久化 `sandbox_id`；持久化失败则 `releaseUntrackedSandbox` 释放，避免泄漏容器；
   3. `stageFiles`：先 `ResetInputs`，再把会话的上传区文件、图片生成产物、skill 资产逐个 `PutFile` 到 `/workspace/uploads|skills`；文件夹上传写 manifest `/workspace/aivory-uploads.txt`；
+     - **skill 资产的路径处理（v2.5.2-beta.12 之后变更）**：原先用 `filepath.Base(a.Filename)` **拍平**成单层文件名，导致 `scripts/office/helpers/__init__.py` 这类官方技能包的 Python import 失效。现在改为 `fileguard.SanitizeRelPath(a.Filename)`（`builtins.go:1389`）**保留子目录结构**，失败时回退到 `filepath.Base`。旁路 `mkdir -p` 负责建父目录，并约束在 `/workspace` 内；`SanitizeRelPath` 是额外的一道自研遍历闸门。
   4. `t.sandbox.Exec(sessionID, code)`；
   5. 产物 `saveArtifact`（Source=`ArtifactSourcePythonExecute`）+ `tc.OnArtifact` 触发 SSE；
   6. **截断输出** stdout/stderr 到 `pythonExecuteStdoutStderrTruncationCap`（默认 32KB，Pitfall A5 防刷上下文）；
   7. 返回文本给模型（含 `Produced files:` 列表，提示「文件已自动附加，用文件名引用，别用 sandbox:/workspace/outputs 路径」）。
-- `contextEnded` / `abandonPythonSession`（`builtins.go:1532-1530`）：客户端取消时清掉 `sandbox_id`，避免后续请求排队在一个已无人消费的阻塞 handler 后。
+- `abandonPythonSession`（`builtins.go:1523`）/ `contextEnded`（`builtins.go:1540`）：客户端取消时清掉 `sandbox_id`，避免后续请求排队在一个已无人消费的阻塞 handler 后。
 
 ### 3.5 每次调用按会话锁串行化
 
@@ -279,7 +280,7 @@ POST {BaseURL}/files/reset-inputs {session_id}
 
 - `Enabled()` 取决于 `BaseURL != ""`（`sandbox.go:252`），即 **配置了 `SANDBOX_BASE_URL`（或管理设置 `sandbox_base_url`）**。
 - 沙箱配置来自**管理设置**，每次调用重读（`sandbox_settings.go:37-57`），键名：`sandbox_base_url`、`sandbox_api_key`、`sandbox_idle_ttl_sec`、`sandbox_exec_timeout_sec`，以及归档存储 `storage_provider`（s3/aliyun_oss/local）等。env 只是 boot 默认值。
-- 未配置时 `python_execute` 走 **safe-mode**（`builtins.go:1206-1217`）：只对 `print(expr)` 做本地算术求值（`tryQuickArithmetic`，一个极小的 shunting-yard，`builtins.go:1642`），其余返回提示「Configure a sandbox URL + key in Admin settings」。
+- 未配置时 `python_execute` 走 **safe-mode**（`builtins.go:1206-1217`）：只对 `print(expr)` 做本地算术求值（`tryQuickArithmetic`，一个极小的 shunting-yard，`builtins.go:1634`），其余返回提示「Configure a sandbox URL + key in Admin settings」。
 - `Registry.listRegistered` 在 `python_execute` 依赖不可用时直接**不列出**该工具；执行时 `checkCurrentToolAccess` 再拦一次（`registry.go:655-657`）。
 
 ---
@@ -343,7 +344,8 @@ POST {BaseURL}/files/reset-inputs {session_id}
 5. 失败时 `invalidateMCPClient` 只删当前实例（不留脏会话），错误经 `redactMCPError` 脱敏。
 6. 结果：`text := TextContent()`；若 `IsError` 则当作工具错误；把 `content` 里的 text/resource（仅 http/https URL）转成 `llm.Citation`（`registry.go:868-893`）。
 
-**凭据脱敏**：`redactMCPToolSnapshotMetadata` / `redactMCPXMLText` / `redactMCPJSONSnapshot`（`registry.go:1093-1216`）确保模型可见的 schema/名/描述里不出现配置的 header 值（如 Bearer token）；红色/掩码为 `[redacted]`。
+**凭据脱敏**：共有**四个**脱敏函数（`redactMCPToolSnapshotMetadata:1093` / `redactMCPJSONSnapshot:1134` / `redactMCPText:1192` / `redactMCPError:1218`，`registry.go:1093-1232`），确保模型可见的 schema/名/描述里不出现配置的 header 值（如 Bearer token）；掩码常量 `mcpRuntimeSecretMask = "[redacted]"`（`registry.go:1085`）。
+> 注：曾有文档写作 `redactMCPXMLText`，该函数**在整个仓库中不存在**。
 
 **用户 MCP 的租户隔离**：
 - `mcpFunctionSourceIdentity`（`registry.go:484-493`）：用户表用 `usermcp:<len>:<id>...`，防止管理员/用户表 id 复用。
@@ -590,9 +592,9 @@ async with streamablehttp_client(url, headers=headers, timeout=30) as (read, wri
 | `server/internal/tools/builtins.go` | 7 个内置工具实现 |
 | `server/internal/tools/call_logging.go` | `Registry.Run` 日志包装、异步落库 |
 | `server/internal/tools/sandbox_settings.go` | settingsSandbox（管理设置 → 沙箱配置） |
-| `server/internal/tools/sandbox_folder_staging.go` 等 | 沙箱 staging 辅助 |
-| `server/internal/tools/toolnames/names.go` | 工具名常量 |
-| `server/internal/tools/tooldiagnostics/diagnostics.go` | 诊断采样/脱敏 |
+| `server/internal/tools/builtins.go:1079` | `sandboxUploadPath`：决定 staging 落点，是「目录上传保留树形 / 普通上传保持扁平」的唯一判定点（注意：**没有** `sandbox_folder_staging.go` 这个文件，只有同名的 `_test.go`） |
+| `server/internal/toolnames/names.go` | 工具名常量（注意：不在 `tools/` 下，而在 `internal/` 下） |
+| `server/internal/tooldiagnostics/diagnostics.go` | 诊断采样/脱敏（注意：不在 `tools/` 下，而在 `internal/` 下） |
 | `server/internal/sandbox/sandbox.go` | HTTPSandbox、HTTP 协议、StorageConfig |
 | `server/internal/sandbox/archive_browser.go` | 归档只读浏览、IsSessionGone |
 | `server/internal/mcp/{client,transport,types}.go` | MCP Streamable HTTP client |

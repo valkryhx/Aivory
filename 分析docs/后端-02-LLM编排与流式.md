@@ -196,7 +196,7 @@ func providerIDForChannelType(t string) string {
 - 非流式模型这里发完整 `text_delta`（4835-4859）。
 - 发 `done`（带 `Usage` 与 `Credits`）：
 ```go
-onEvent(SseEvent{Type:"done", MessageID:assistantMsg.ID, StopReason:"...", Usage:&usage, Credits: ...})   // orchestrator.go:4523
+onEvent(SseEvent{Type:"done", MessageID:assistantMsg.ID, StopReason:"...", Usage:&usage, Credits: ...})   // orchestrator.go:4854-4858
 ```
 
 **第 14 步 —— 异步记忆**（orchestrator.go:4867-4872）：`memory.process`（$6）。
@@ -238,7 +238,8 @@ onEvent(SseEvent{Type:"done", MessageID:assistantMsg.ID, StopReason:"...", Usage
 **内容增量**：
 - `text_delta` —— 正文字符增量。
 - `thinking_delta` —— 推理/思考增量。
-- `thinking`（终态带 `thinking_ms`）。
+
+> ⚠️ **没有名为 `thinking` 的事件类型**。`thinking_ms` 是 `done`/`error` 终态事件上的**字段**，由 `onEvent` 包装器在终态注入（`orchestrator.go:2746-2753`：`thinkingDuration.Observe(event)` 后写回 `event.ThinkingMs`），不是独立事件。
 
 **工具**：
 - `tool_start{name,id}` —— 工具开始。
@@ -248,7 +249,7 @@ onEvent(SseEvent{Type:"done", MessageID:assistantMsg.ID, StopReason:"...", Usage
 
 **引用/RAG**：
 - `citation{citation}` —— 一条引用。
-- `source_count{n}` —— RAG 进度。
+- `rag{status, source_count}` —— RAG 进度。⚠️ 事件类型是 **`rag`**，不是 `source_count`；`source_count` 是它上面的一个**字段**（`orchestrator.go:3552/3555/3570/3580/3616`）。典型 `status` 值：`document_searching`、`searching` 及各类进度状态。
 
 **Verify**：`verify_started` / `verify_finding` / `verify_done`（types.go:311-316）。
 
@@ -302,16 +303,19 @@ HTTP 侧封装在 `server/internal/sse/sse.go`：
 
 ### 5.2 Provider 内部的多轮循环
 
-**OpenAI Chat Completions**（openai_provider.go `streamChat`，183-486）：`for i := 0; i < maxIter; i++`，`maxIter=envcfg.Int("AIVORY_LLM_MAX_ITER_2", 20)`。每轮：
+**OpenAI Chat Completions**（openai_provider.go `streamChat`，183-486）：循环条件是 **`for i := 0; i < maxIter || finalizationPending != nil; i++`**（`:259`）——注意不是单纯的 `i < maxIter`。`maxIter=envcfg.Int("AIVORY_LLM_MAX_ITER_2", 20)`。每轮：
 1. `POST baseURL+"/chat/completions"`，`stream:true` + `stream_options:{include_usage:true}`。
-2. `readOpenAIChatStream` 解析 SSE：`data:` 帧、`[DONE]` 终帧；`reasoning_content`→`thinking_delta`、`content`→`text_delta`、`delta.tool_calls`→`tool_start`+`tool_input(partial_json)`。
+2. `readOpenAIChatStream`（`openai_provider.go:1363`）解析 SSE：`data:` 帧、`[DONE]` 终帧；`reasoning_content`→`thinking_delta`、`content`→`text_delta`、`delta.tool_calls`→`tool_start`+`tool_input(partial_json)`。
+   - **多行事件（v2.5.2-beta.12 之后修复）**：SSE 规范允许一个 event 由**多条** `data:` 行组成，JSON 载荷按换行拼接。原先的实现逐行 `strings.HasPrefix(line, "data:")` 解析，遇到把 JSON 折成多行的提供商（如某些 OpenAI 兼容网关）会**逐行 JSON 解析失败**。现在由 `readOpenAIChatEvent`（`openai_provider.go:1324`）按空行分隔聚合整个 event，再用 `\n` 拼接各 `data:` 值，并**同时对聚合后的总字节数**施加 `readOpenAIChatStreamBufMax` 上限（防止绕过单行限制）。
+     > 复刻要点：Python 端解析上游 SSE 时**不要按行 `json.loads`**。正确做法是累积 `data:` 行直到空行，再以 `"\n".join(...)` 解析，且对累积结果单独限长。此外保留「最后一个 event 可能没有结尾空行」的容忍（`readOpenAIChatEvent` 末尾的 EOF 分支）。
 3. 若本轮有 `tool_calls`：组装 assistant tool_calls 消息 → `runToolsConcurrent(ctx, tools, specs, onEvent)` 并发执行 → 发 `tool_result` → 追加 `role:tool, tool_call_id, content` 消息 → 下一轮。
-4. 到达 `maxIter` 仍未结束 → `ErrToolBudgetExceeded`（由外层做"无工具收尾"）。
+4. 到达 `maxIter` 时**不会立刻退出**：`finalizationPending` 被置为 `ErrToolBudgetExceeded`（`:473-475`），循环条件里的 `|| finalizationPending != nil` 让它在下一轮**补发一次不带工具的终结请求**，把已产生的工具结果收束成最终回答。最终 `UnifiedResult.StopReason = "max_iterations"`（`:482`）。
+   > 复刻要点：如果 Python 端在 `i >= maxIter` 直接 break，"最后一轮工具结果无人总结"的边界行为会与原版不一致（表现为答案截断或缺少最终文本）。
 
-**OpenAI Responses**（openai_provider.go `streamResponses`，1492-1938）：
+**OpenAI Responses**（openai_provider.go `streamResponses`，1535-1982）：
 - `POST /responses`，`store:false`（**硬规则**，分片不保存中间产物）。
 - `maxIter=envcfg.Int("AIVORY_LLM_MAX_ITER_3", 20)`。
-- 事件 taxonomy 见 `readOpenAIResponsesStream`（1992-2605）：
+- 事件 taxonomy 见 `readOpenAIResponsesStream`（2035-2649）：
   - `response.output_text.delta` → `text_delta`
   - `response.reasoning_summary_text.delta` → `thinking_delta`
   - `response.output_item.added`（function_call）→ `tool_start`
@@ -365,12 +369,15 @@ sem := make(chan struct{}, maxConcurrentTools)
 1. **轮数触发**：保留 `keepRounds*2` 条（`keep_recent_rounds` 默认 6），`compactionRoundOverflow` 需 `tail >= keepMsgs + 8`（默认批 4 轮 ×2）才触发（compaction.go:1166-1171）——维护性操作，不必每轮做。
 2. **token 触发**：总上下文（系统提示词+工具+RAG+历史）超过 `compaction_token_trigger`（高水位）。目标设在 `trigger*60%`（低水位），避免下一次普通追问立刻又越线（compaction.go:47-52, 1095-1107）。
 
-**token 估计**（compaction.go:146-236 `estimateMsgTokens`）：
+**token 估计**（`compaction.go:152-236` `estimateMsgTokens`）：
 - 注意力重点：**统计与 provider 实际发送的字节一致**——若消息带原生 `raw`（工具轮，同厂商），provider 会逐字回放 `raw`，所以从 `raw` 估算（含被块级 Text/Summary 省略的完整工具入出参）。
 - CJK 按「每字符一 token」计（`estimateTokens`），因为 `len(s)/4` 会低估中文约 3 倍（compaction.go:1453-1454）。
 - 带 `msgTokenMemo` 缓存（上限 100000 项），否则每轮对每条消息 O(history) 重算。
 
-**contextTokens**（compaction.go:1001-1042）最偏好 provider 自己的计数：取最近一条助手消息的 `input_tokens + cache_read_tokens`（必须含 cache，否则 prompt caching 下严重低估），fallback 到启发式估计。
+**contextTokens**（`compaction.go:1001-1042`）最偏好 provider 自己的计数，但有细节：
+- 从最新的助手消息回溯，取 **`ContextTokens`**（provider 记录的真实上一轮 prompt 总数）；若该列为 0，回退到 `InputTokens + CacheReadTokens`（**必须含 cache**，否则 prompt caching 下严重低估）。
+- 拿到 `real` 后与启发式 `est` **取 max**，而不是直接采信——否则本轮新注入的文件/上下文会漏算，导致触发阈值慢一拍。
+- `requestEstimateComplete=true`（编排路径 `PlanCompactionForRequest` 传入的完整装配估算）时**不再与 raw store 行取 max**：因为 NoTools / fast 模式 / 模型切换 / vision 过滤可能已刻意移除 provider envelope 与工具块，取 max 反而会高估。
 
 ### 6.2 保留窗口裁切（compaction.go:1142-1170, 1580-1670）
 

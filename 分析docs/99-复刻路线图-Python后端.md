@@ -108,7 +108,7 @@ aivory-python-backend/
 
 ### 阶段 2：对话与 LLM 编排（产品核心）
 - 会话/消息/分支表迁移。
-- 实现 Provider 注册表 + Orchestrator + SSE 流式（delta/thinking/tool_logs/done）。
+- 实现 Provider 注册表 + Orchestrator + SSE 流式（`text_delta` / `thinking_delta` / `tool_start` / `tool_result` / `citation` / `done`）。⚠️ 事件名不是 `delta`/`thinking`/`tool_logs`——见第 4 节的事件表。
 - 实现 TaskLLM（结构化输出）用于标题生成等。
 - **关键验收**：原前端能发消息、看到流式增量输出、能停止生成、对话出现自动标题。事件协议必须与 `后端-02-LLM编排与流式.md` 中记录的一致。
 
@@ -144,15 +144,30 @@ aivory-python-backend/
 
 1. **HTTP 端点路径与方法**：`POST /api/auth/login`、`POST /api/auth/refresh`、`GET /api/me`、`POST /api/conversations/:id/messages`、`GET /api/events`（实时事件流）等 —— 见 `src/api/endpoints.ts` + `后端-01`。
 2. **鉴权**：请求头 `Authorization: Bearer <access_token>`；刷新用 refresh token；过期/刷新语义与原一致。
-3. **JSON 字段命名**：后端 JSON 字段用 camelCase，`src/api/types.ts` 定义的接口字段名必须原样匹配（Pydantic 可用 `alias` 或直接同名）。
-4. **SSE 事件格式**：事件名（`delta`、`thinking`、`tool_logs`、`done`、`conversation.updated`…）与每个事件负载的 JSON schema —— 见 `后端-02` 与 `前端-02`。
+3. **JSON 字段命名**：`src/api/types.ts` 定义的接口字段名必须原样匹配（Pydantic 可用 `alias` 或直接同名）。
+   - ⚠️ **两种风格并存，不要一刀切**：
+     | 位置 | 风格 | 例子 |
+     |---|---|---|
+     | 面向客户的 API 响应（handler 的响应结构体） | **camelCase** | `publicKey`、`displayName`、`supportedGenerationMethods` |
+     | `SseEvent` 全部字段 | **snake_case** | `message_id`、`partial_json`、`stop_reason`、`source_count`、`thinking_ms`、`input_tokens` |
+     | 内部 store 结构体（经 api 层转换后才出网） | snake_case | `group_id`、`totp_enabled`、`cache_read_tokens` |
+   - 统计：`server/internal/api/*.go` 的 json tag 中 camelCase 758 个、snake_case 451 个。复刻时**逐字段照抄**原 tag，不要按单一约定批量转换——SSE 那一层全是 snake_case。
+4. **SSE 事件格式**：`SseEvent.type` 的取值与每个事件的 payload schema —— 见 `后端-02` 与 `前端-02`。
+   - 聊天流（`POST .../messages`）实际取值：`text_delta`、`thinking_delta`、`tool_start`、`tool_input`、`tool_result`、`citation`、`artifact`、`image`、`image_status`、`rag`、`preference`、`refusal`、`message_start`、`research_*`（plan/phase/task/note/source）、`verify_*`（started/finding/done）、`title`、`usage`、`status`、`done`、`error`。
+   - ⚠️ 注意区分三个通道，别混用命名：
+     | 通道 | 事件名风格 | 举例 |
+     |---|---|---|
+     | 聊天 SSE（POST messages） | 小写下划线 | `text_delta`、`tool_start`、`done` |
+     | 实时事件 `GET /api/events` | 小写点号 | `conversation.updated`、`account.permissions_updated`、`admin.*` |
+     | 数据库表名（**不是**事件） | 小写下划线 | `tool_call_logs` —— 曾误写为 SSE 事件 `tool_logs`，该事件**不存在** |
 5. **资源 ID 格式**：`前缀_12位hex`（`co_`、`msg_`、`kb_`…）—— 见 `后端-05`。
 6. **错误响应结构**：错误 body 的字段形态（`{error: ...}` 等）。
 7. **实时事件（events）**：跨设备实时推送（通知、会话更新）所用的订阅通道。
 
 ### 兼容策略建议
 - **先写一份「协议契约」**（从 `src/api/types.ts`、`endpoints.ts`、`后端-01/02` 提取），作为 Pydantic schema 与测试的依据。
-- **用原前端 + 新后端做集成测试**（可复用仓库 `tests/browser/*.mjs` 的 Playwright 用例），每阶段一个冒烟集。
+- **用原前端 + 新后端做集成测试**（可复用仓库 `tests/browser/*.mjs` 的浏览器冒烟用例——注意它们用的是 **`puppeteer-core`**，不是 Playwright，需本机有 Chrome 并由 `CHROME_PATH` 指定；默认连 `http://127.0.0.1:5176`，可用 `AIVORY_AUTH_LAYOUT_TEST_URL` 覆盖），每阶段一个冒烟集。
+- 前端单测在 `tests/frontend/`（Vitest 镜像 `src/` 结构），沙箱回归测试在 `tests/sandbox-service/`（Python 标准库 unittest）。
 
 ---
 
@@ -183,7 +198,7 @@ aivory-python-backend/
 4. **协议边界反推**：前端对不少行为的假设（如 `GET /api/events` 长连接、SSE 逗号分隔/格式）藏在源码里，**逐个验证**，别凭想象。
 5. **计费/支付**：涉及真实钱款，先做「积分消耗记账」逻辑与隔离，Stripe 接入放最后且要测试 webhook 签名。
 6. **安全**：限流、验证码、SSRF、上传校验、生产 JWT 守卫——原项目考虑非常细，复刻时不要砍掉。
-7. **规模**：后端约 400+ 个 Go 文件、441 条路由。**不要试图一次性全部搬**，按第 3 节阶段推进，每阶段都能跑。
+7. **规模**：后端约 **354 个非测试 Go 文件**（含测试共 818 个）、443 条路由。**不要试图一次性全部搬**，按第 3 节阶段推进，每阶段都能跑。
 
 ---
 
@@ -194,7 +209,7 @@ aivory-python-backend/
 | M1 协议基线 | 原前端连接新后端，登录页加载、`/api/health` ok |
 | M2 认证闭环 | 前端能注册/登录/退出，`/api/me` 返回用户 |
 | M3 对话闭环 | 前端能对话、流式渲染、停止生成、自动标题、对话分支渲染 |
-| M4 工具+沙箱 | 前端发起需要工具的请求，沙箱出结果回填，tool_logs 展示 |
+| M4 工具+沙箱 | 前端发起需要工具的请求，沙箱出结果回填，工具调用轨迹（`tool_start`/`tool_input`/`tool_result` 事件）展示 |
 | M5 RAG | 前端上传文档入库，检索到引用并展示来源 |
 | M6 完整度 | 管理后台可配 Channel/Model；文件上传/预览；计费记账 |
 | M7 部署 | Docker Compose 双配置（个人 SQLite / 生产 PG+Redis+Qdrant）跑通 |

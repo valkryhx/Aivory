@@ -1,15 +1,15 @@
 # Aivory 桌面客户端(Electron)调研文档
 
-> 调研目标仓库:`D:\git_codes\Aivory`,目录 `desktop/`
+> 调研目标仓库:`d:\git_repos\Aivory`,目录 `desktop/`
 > 目的:为「后端换成 Python 复刻」评估是否要做桌面端、以及若要做需要满足哪些接口。
-> 本文所有引用均为真实源码位置,格式为 `文件:行号`(路径相对仓库根 `D:\git_codes\Aivory\`)。
+> 本文所有引用均为真实源码位置,格式为 `文件:行号`(路径相对仓库根 `d:\git_repos\Aivory\`)。
 
 ---
 
 ## 1. 结论速览
 
 - **桌面客户端是一个"纯壳"**:Electron 壳只负责本地打包前端(HTML/JS/CSS)+ 把 `/api` 请求代理到远程 Aivory 服务器。**它不承载后端,也不内嵌任何 Node HTTP 服务器**。
-- **前端的本地加载方式**:通过 Electron 自定义协议处理器把 `https://app.aivory.invalid/` 这个"假 origin"映射到本地 `web/` 目录(`local-web.cjs:7`),没有 HTTP listener、没有端口(`local-web.cjs:6-8`)。
+- **前端的本地加载方式**:通过 Electron 自定义协议处理器把 `https://app.aivory.invalid/` 这个"假 origin"映射到本地 `web/` 目录(`local-web.cjs:8`),没有 HTTP listener、没有端口(`local-web.cjs:6-8`)。
 - **桌面应用本身不发起 AI 推理**:所有推理、用户、订阅、知识库逻辑都在远程 Go 后端。桌面端 = 浏览器 + 代理 + 桌面集成(托盘、通知、更新、支付)。
 - **复刻建议**:若目标是个人/SaaS 部署,**先只做 Web 版即可,桌面端完全可延后**。桌面端唯一的硬需求是后端暴露 `/api` HTTP 接口 + 4 个「desktop 专属接口」(浏览器登录 PKCE 流 + 更新清单 + 下载链接),见第 4 节「复刻要点」,这些在 Python 后端里只用约 3 个 handler + 2 个存储配置即可对上。
 - 注意:原始后端是 **Go**(`server/internal/api/desktop_*.go`),不是 JS/Node。本文涉及的 server 端接口引用的是 Go 源码。
@@ -67,7 +67,7 @@
 
 ### 3.1 不内嵌后端,只代理 API
 
-- 桌面端启动后,若配置了服务器地址 `baseUrl`,主窗口直接 `loadURL(APP_URL)`,即加载本地协议 `https://app.aivory.invalid/`(`desktop/main.cjs:8,224-233`;`local-web.cjs:7`)。
+- 桌面端启动后,若配置了服务器地址 `baseUrl`,主窗口直接 `loadURL(APP_URL)`,即加载本地协议 `https://app.aivory.invalid/`(`desktop/main.cjs:8,224-233`;`local-web.cjs:8`)。
 - 该 origin 由 `desktopSession.protocol.handle('https', createLocalHandler(...))` 接管(`desktop/main.cjs:265-274`),`createLocalHandler` 从磁盘 `web/` 目录读取静态文件(`local-web.cjs:92-109`),实现**离线本地加载前端**(无任何端口、无 HTTP 服务)。
 - `/api` 路径命中时,协议处理器把请求转发到远程 `baseUrl`(`local-web.cjs:34-87`):剥离本地 header、设置远端 Origin 以通过 CSRF、`credentials:'include'`、透传流式 body(SSE 不缓冲,`local-web.cjs:64-66`),并把 `set-cookie` 留在远端 session 中(HTTP-only)。`serverUrl()` 负责把本地 URL 改写为远端 URL(`local-web.cjs:24-27`)。
 - 结论:**桌面端零 Node 后端运行**,需要的只是一个"提供 `/api` 的远程 HTTP 服务"。这对 Python 后端是绝对利好——只要 Python 后端实现 `/api` REST 接口,桌面壳无需改就行。
