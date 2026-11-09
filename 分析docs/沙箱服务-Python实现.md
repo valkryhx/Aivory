@@ -121,6 +121,17 @@ oss2==2.19.1        # Aliyun OSS 归档
 | `SANDBOX_LOCAL_STORAGE_DIR` | 空(可选) | 本地归档目录(默认存储后端) |
 | `SANDBOX_MAX_ARCHIVE_BYTES` | `200MB` | 工作区归档上限 |
 | `SANDBOX_STORAGE_DEFAULT_TTL` / `MAX_TTL` | `3600` / `86400` | presigned URL TTL |
+| `SANDBOX_ARCHIVE_TIMEOUT_S` | `120` | 归档 tar 读取循环的墙钟上限（reaper/DELETE 持会话锁时防止永久阻塞） |
+| `SANDBOX_DOCKER_CALL_TIMEOUT_S` | `30` | 普通 `docker` 控制调用（inspect/version）默认超时 |
+| `SANDBOX_IDLE_TTL_CAP_SECONDS` | `86400` | 管理员可调 idle TTL 的硬上限（`idle_ttl_sec` 被 clamp） |
+| `SANDBOX_QUEUE_TIMEOUT_SECONDS` | `150` | 等待执行槽/创建槽的最长时间，超时 429 |
+| `SANDBOX_MAX_UPLOAD_BYTES` | `40MB` | `/files` 单文件上传上限（在 56MiB 请求体上限之内） |
+| `SANDBOX_MAX_COLLECT_SECONDS` / `SANDBOX_COLLECT_FILE_TIMEOUT_S` | `60` / `30` | 单次 exec 产物收集总预算 / 单文件读取超时 |
+| `SANDBOX_MAX_ARCHIVE_SCAN_BYTES` / `SANDBOX_MAX_ARCHIVE_MEMBERS` | `1GiB` / `20000` | 归档浏览的流式解压上限与成员数上限（防 tar 炸弹） |
+| `SANDBOX_MAX_STORAGE_BODY_BYTES` | `300MiB` | 仅 `/storage/put` 的请求体上限（RAG 上传大 PDF 用） |
+| `SANDBOX_PULL_ON_START` | 关闭 | 启动时 best-effort `docker pull` 运行时镜像（`1/true/yes/on` 开启） |
+| `SANDBOX_NOFILE_ULIMIT` | `1024:1024` | 会话容器 `--ulimit nofile` |
+| `SANDBOX_S3_MAX_ATTEMPTS` / `SANDBOX_S3_CONNECT_TIMEOUT_S` / `SANDBOX_S3_READ_TIMEOUT_S` / `SANDBOX_OSS_CONNECT_TIMEOUT_S` | `3` / `10s` / `120s` / `30s` | 对象存储 SDK 的重试与超时，防止慢桶冻结 reaper |
 
 ---
 

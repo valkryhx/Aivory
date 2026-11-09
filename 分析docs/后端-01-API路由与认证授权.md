@@ -1,7 +1,7 @@
 # Aivory 后端调研 01：HTTP API 路由层 + 认证授权系统
 
 > 目标：深度复刻 Aivory 的 Go 后端（后端换成 Python/FastAPI）。本文聚焦 **Go 后端 HTTP API 路由层 + 认证授权系统**，为 FastAPI 复刻提供协议/字段/时序级参考。
-> 源码根：`d:\git_repos\Aivory\server`
+> 源码根：仓库根下的 `server/`（本仓库为 `d:/git_codes/Aivory/server`）
 > 涉及包：`internal/api`（router/middleware/handlers）、`internal/auth`（JWT/TOTP）、`internal/oauth`（OAuth 提供商）、`internal/store/refresh_tokens.go`（会话持久化）。
 
 ---
@@ -9,7 +9,7 @@
 ## 0. 架构总览
 
 - 后端是一个**单二进制 Go 进程**，使用**标准库 `net/http` + 手写微型 mux**（`internal/api/mux.go`），刻意不引入 gin/echo 等路由框架，减少依赖面。
-- 所有路由统一在 `NewRouter(d Deps) http.Handler`（`router.go:149`）中注册，共 **443 条** `mux.handle(...)` 调用（`grep -c` 验证；其中 `/api/admin/*` 前缀 202 条）。
+- 所有路由统一在 `NewRouter(d Deps) http.Handler`（`router.go:149`）中注册，共 **443 条** `mux.handle(...)` 调用（`grep -c` 验证；其中 `/api/admin/*` 前缀 202 条）。注意 `mux.handle("GET", "/api/public/maps/_AMapService"+suffix, ...)` 位于一个 3 元素循环内，因此实际注册的路径模式是 **445** 个。
 - 依赖通过 `Deps` 结构体（`router.go:35`）注入：DB（`*sql.DB`）、Cache（Redis/内存抽象）、Auth（JWT service）、Queue、Mailer、LLM Provider、RAG、Passkey service、Logger 等。**v2.5.2-beta.12 之后新增字段** `SkillImportHTTPClient *http.Client`（`router.go:63-66`）——仅供测试注入，生产留 `nil`，走 SSRF 加固的 `netsafe` 客户端。
 - **鉴权模型**：短时效 access JWT（cookie `auth_token` 或 `Authorization: Bearer`）+ 长时效 refresh JWT（HttpOnly cookie `refresh_token`，Path 限定 `/api/auth`），配合数据库中 `refresh_tokens` 表做会话持久化、旋转与撤销。
 - **分层中间件链**（从外到内）：`errorResponseLoggingMiddleware` → `recoverMiddleware` → `spaHandler`(可选) → `corsMiddleware` → `siteAccessMiddleware` → 自定义 mux → 路由级包装器(`rateLimitedIP`/`requireAuth`/`requireAdmin`)。
@@ -86,6 +86,7 @@
 | GET /api/me/memories 等 | 记忆 CRUD（requireMemoryHandler） |
 | POST /api/me/redeem | 兑换码 ⏱ 10/60s |
 | GET /api/me/skills、/prompts、/mcps、/images、/files、/storage、/ppt/* | 技能/提示词/MCP/图片/文件/PPT 子资源 |
+| GET /api/audio/capabilities、POST /api/audio/transcriptions、GET /api/audio/stream | 语音能力探测 / 音频转写 / WebSocket 音频流；均受用户组 `AllowVoiceTranscription` 能力位门控（`router.go:389-395`）。`/api/audio/stream` 是 WebSocket 升级端点，也是请求签名豁免项 |
 
 #### D. 会话/聊天（`/api/conversations`、`/api/messages`）
 | 方法/路径 | 用途 |

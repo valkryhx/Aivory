@@ -175,12 +175,12 @@ type ToolDef struct {
 | 工具名 | 注册位置 | 用途 | InputSchema |
 |---|---|---|---|
 | `aivory_web_search` | `builtins.go:112`（`webSearchTool`，struct 在 :107） | 联网搜索（可批量、可搜图） | `registry.go` 里动态拼，见下 |
-| `web_fetch` | `builtins.go:367`（`webFetchTool`） | 抓取网页正文 + 图片元数据，SSRF 防护 + Jina 兜底 | `{"type":"object","properties":{"url","urls","show_images"}}` |
-| `fetch_image` | `builtins.go:768` | 下载公开图片进沙箱 `/workspace/downloads/` | `{"type":"object","properties":{"url","filename"},"required":["url"]}` |
-| `python_execute` | `builtins.go:1186` | 在持久 Python 沙箱跑代码（数学/数据分析/图像编辑/绘图/文档编辑/生成下载文件） | `{"type":"object","properties":{"code":{"type":"string","minLength":1}},"required":["code"]}` |
-| `image_generate` | `builtins.go:1765` | 图生图 / 文生图（Gemini / OpenAI 双通道） | `{"type":"object","properties":{"prompt","action","base_image","base_image_index","n","size"},"required":["prompt","action","base_image"]}` |
-| `use_skill` | `builtins.go:3668` | 加载已注册技能的完整说明 | `{"type":"object","properties":{"name"},"required":["name"]}` |
-| `save_memory` | `builtins.go:3760` | 持久化用户长期记忆 | `{"type":"object","properties":{"memory_text","slot","value"},"required":["memory_text"]}` |
+| `web_fetch` | `builtins.go:337`（`webFetchTool`，Execute :381） | 抓取网页正文 + 图片元数据，SSRF 防护 + Jina 兜底 | `{"type":"object","properties":{"url","urls","show_images"}}` |
+| `fetch_image` | `builtins.go:762`（Execute :781） | 下载公开图片进沙箱 `/workspace/downloads/` | `{"type":"object","properties":{"url","filename"},"required":["url"]}` |
+| `python_execute` | `builtins.go:1179`（Execute :1198） | 在持久 Python 沙箱跑代码（数学/数据分析/图像编辑/绘图/文档编辑/生成下载文件） | `{"type":"object","properties":{"code":{"type":"string","minLength":1}},"required":["code"]}` |
+| `image_generate` | `builtins.go:1758`（Execute :1840） | 图生图 / 文生图（Gemini / OpenAI 双通道） | `{"type":"object","properties":{"prompt","action","base_image","base_image_index","n","size"},"required":["prompt","action","base_image"]}` |
+| `use_skill` | `builtins.go:3664`（Execute :3680） | 加载已注册技能的完整说明 | `{"type":"object","properties":{"name"},"required":["name"]}` |
+| `save_memory` | `builtins.go:3756`（Execute :3774） | 持久化用户长期记忆 | `{"type":"object","properties":{"memory_text","slot","value"},"required":["memory_text"]}` |
 
 ### 2.1 web_search 的动态 schema（值得注意）
 
@@ -395,14 +395,20 @@ func (s *Writer) SendID(payload any, eventName, id string) error {
 on-the-wire 事件形状（`llm/types.go:280-317`）：`Source/Type/MessageID/Text/Name/ID/PartialJson/Input/Summary/URL/Title/Citation/StopReason/Usage/Message/Code/ToolID/Status/SourceCount/Credits/ThinkingMs` 等，全部 `lowercase, snake_case`。
 
 从 provider 与编排器实际发出的事件（`Type` 字段取值）包括：
+- `message_start`（`MessageID`）：助手占位已建，流的第一个事件。
+- `text_delta`（`Text`）：正文增量。⚠️ 是 **`text_delta`，不是 `delta`**（`delta` 仅用于 AI PPT 大纲流，是另一套协议）。
+- `thinking_delta`（`Text`）：推理/思考增量。
 - `tool_start`（`Name`+`ID`+`Input`）：**每个工具调用先宣布**（`tool_exec.go:910`）。
 - `tool_input`（`PartialJson`）：流式增量工具输入 JSON 片段（`anthropic_provider.go:1117`）。
 - `tool_result`（`Name/ID/Summary/Status`）：工具结果展示（`anthropic_provider.go:543`、`openai_provider.go`，Summary 截断）。
+- `citation`（`Citation`）：RAG/网页引用的**唯一来源**。
+- `rag`（`Status`+`SourceCount`）：检索进度。
 - `artifact`：工具产出文件（沙箱输出 / 生成图片）已持久化（`OnArtifact` 触发，`orchestrator.go:4188-4230`）。
-- `done`（带 `Usage`、`Credits`、可选 `ThinkingMs`）：回合结束。
-- `delta`：文本增量。
-- `verify` 系列：`verify_started/verify_finding/verify_done`（审计模式）。
-- `tool_call` 等是**持久化 message block 的 Kind**（`UnifiedBlock`：`tool_call`/`tool_output`/`tool_result`/`artifact`/`document`/`attachment`），与 SSE 事件是两套东西。
+- `image_status`（`Status`）、`refusal`（`Message`）：图片阶段与模型拒答/拦截。
+- `research_plan/task/source/note/phase`：Deep Research 进度。
+- `verify_started/verify_finding/verify_done`：审计模式。
+- `done`（带 `Usage`、`Credits`、可选 `ThinkingMs`）：回合结束；`error`：异常结束。
+- `tool_call` 等是**持久化 message block 的 Kind**（`UnifiedBlock`：`tool_call`/`tool_output`/`tool_result`/`artifact`/`document`/`attachment`），与 SSE 事件是两套东西。完整字段与语义见《后端-02》§4。
 
 ### 5.3 消息增量缓存（`internal/msgcache/msgcache.go`）
 

@@ -230,6 +230,10 @@ ragSlowQueueName = "rag"        // PDF/扫描件慢件,   concurrency=4
 | `ingestFinalizeTimeout` | 30 s | 收尾阶段超时 |
 | `ingestAsynqLeaseMaxRetries` / `ingestAsynqRetryDelay` | 1 / 2 min | 仅"租约丢失"才重试 |
 | `runIngestMaxAttempts` / `runIngestRetryBackoff` | 3 / 3 s | 管线内部重试次数与退避基数 |
+| `ingestQueueClassifyTimeout` | 2 s | 入队前判断快/慢 lane 的超时（`AIVORY_RAG_INGEST_QUEUE_NAME`，注意变量名与语义不完全对应） |
+| `heartbeatWriteTimeout` | 5 s | 单次心跳写入的超时（`AIVORY_RAG_START_INGEST_HEARTBEAT`） |
+| `finalizeChunkCleanupTimeout` | 10 s | 失败收尾时清理 chunk 的超时 |
+| `finalizeStatusTimeout` | 10 s | 失败收尾时写终态的超时 |
 
 > 另注：map-reduce 摘要的 asynq task kind 是 **`task.rag_map_reduce`**（`rag.go:4190`），别只在文档层面描述"map-reduce"却不实现这个 task 名——asynq 侧按字符串匹配。
 
@@ -382,7 +386,7 @@ type Snippet struct {
 | 电子表格 | `openpyxl`(xlsx) / `pandas`(csv) | 对齐 `spreadsheet.go` 的"行/列/sheet 上限"截断行为 |
 | 传统 doc/ppt/扫描件 OCR | 复用 **MinerU 云 API**(协议同 Go) | 完全同构,**必须保留 `model_version=pipeline, is_ocr=true, enable_formula, enable_table`** |
 | 通用 doc 提取兜底 | `unstructured` / `markitdown` | 可作为本地解析的补充;若完全自托管可选 |
-| 分块 | `langchain_text_splitters` 或 **自研翻译** | Aivory 的"标题面包屑 + 原子表/代码 + 重叠 + JJK句切"语义独特,建议**自研**照抄 `rag.go:2436-2731` |
+| 分块 | `langchain_text_splitters` 或 **自研翻译** | Aivory 的"标题面包屑 + 原子表/代码 + 重叠 + CJK句切"语义独特,建议**自研**照抄 `rag.go:2436-2731` |
 | 嵌入 client | `openai` SDK(OpenAI 兼容) + 本地 `sentence-transformers`/ollama | 保持 `EMBEDDING_MODEL/EMBEDDING_DIM/EMBEDDING_BASE_URL` 兼容;本地哈希 embedder 可保留做 dev fallback(等价 `aivory-local-embed`) |
 | 异步任务 | `celery`(+redis broker) / `arq` / `RQ` | 见 6.3 |
 | Qdrant 客户端 | `qdrant-client`(官方 Python) | 请求/路径/过滤结构直接对照 `qdrant.go` |
@@ -443,7 +447,7 @@ Aivory 的"进程内队列兜底 + asynq 持久"双轨,以及 **DB 心跳/租约
 | embedding 配置 | `EMBEDDING_MODEL/DIM/BASE_URL/API_KEY` + 管理表 `embedding_model_id` | `embedder_http.go:627` |
 | MinerU API | `POST /api/v4/extract/task` + `GET /api/v4/extract/task/{id}` | `parser.go:736/791` |
 | rerank 配置键 | `rag_rerank_enabled/api_url/api_key/model` | `reranker.go:52` |
-| RAG knob | `rag_full_text_threshold=8000`、`rag_top_k=8`、`rag_similarity_threshold=0.5`、`rag_code_full_text_max_lines=2000` | `rag.go:2851` |
+| RAG knob | `rag_full_text_threshold=8000`、`rag_top_k=8`、`rag_similarity_threshold=0.5`、`rag_code_full_text_max_lines=2000`、`rag_dynamic_topk`（bool，默认关闭） | `rag.go:2888-2915` |
 | 向量点 ID | `uuid5(ns, chunk_id)`,`ns=8f4d2c1a-1f2e-4b6a-9c3d-7a0b1c2d3e4f` | `qdrant.go:27` |
 | collection 命名 | `<prefix>c<dim>` 前缀 `aivory_c`,相似度 Cosine | `qdrant.go:22/79/161` |
 

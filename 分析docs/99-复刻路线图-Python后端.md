@@ -153,7 +153,9 @@ aivory-python-backend/
      | 内部 store 结构体（经 api 层转换后才出网） | snake_case | `group_id`、`totp_enabled`、`cache_read_tokens` |
    - 统计：`server/internal/api/*.go` 的 json tag 中 camelCase 758 个、snake_case 451 个。复刻时**逐字段照抄**原 tag，不要按单一约定批量转换——SSE 那一层全是 snake_case。
 4. **SSE 事件格式**：`SseEvent.type` 的取值与每个事件的 payload schema —— 见 `后端-02` 与 `前端-02`。
-   - 聊天流（`POST .../messages`）实际取值：`text_delta`、`thinking_delta`、`tool_start`、`tool_input`、`tool_result`、`citation`、`artifact`、`image`、`image_status`、`rag`、`preference`、`refusal`、`message_start`、`research_*`（plan/phase/task/note/source）、`verify_*`（started/finding/done）、`title`、`usage`、`status`、`done`、`error`。
+   - 聊天流（`POST .../messages`）实际取值：`message_start`、`text_delta`、`thinking_delta`、`tool_start`、`tool_input`、`tool_result`、`citation`、`artifact`、`image_status`、`rag`、`refusal`、`research_*`（plan/phase/task/note/source）、`verify_*`（started/finding/done）、`done`、`error`。
+     - 另：`image` 仅用于**私聊** `/api/private-chat`；AI PPT 大纲流使用**另一套** `delta/done/error` 协议，不属于聊天 SSE。
+     - **不存在**聊天 SSE 事件 `preference` / `title` / `usage` / `status` / `delta` / `tool_logs` / `progress`（`preference` 只是记忆类型值；`delta` 是 AI PPT 的事件名）。
    - ⚠️ 注意区分三个通道，别混用命名：
      | 通道 | 事件名风格 | 举例 |
      |---|---|---|

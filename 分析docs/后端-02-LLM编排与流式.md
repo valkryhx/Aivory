@@ -2,7 +2,7 @@
 
 > 调研对象：Aivory Go 后端 `server/internal/llm/`
 > 目标：以「Python/FastAPI 复刻」为切入点的深度学习文档。所有行号均基于本调研时的源码。
-> 说明：`llm` 包是后端最核心的模块（约 150 个 .go 文件），本文聚焦"编排 + 流式 + Provider 适配 + 工具循环 + 上下文压缩 + 记忆 + 结构化输出"这几条主干，其余（图片、Deep Research、Verify 等）仅点到为止。
+> 说明：`llm` 包是后端最核心的模块（141 个 .go 文件，其中 53 个非测试文件），本文聚焦"编排 + 流式 + Provider 适配 + 工具循环 + 上下文压缩 + 记忆 + 结构化输出"这几条主干，其余（图片、Deep Research、Verify 等）仅点到为止。
 
 ---
 
@@ -250,6 +250,19 @@ onEvent(SseEvent{Type:"done", MessageID:assistantMsg.ID, StopReason:"...", Usage
 **引用/RAG**：
 - `citation{citation}` —— 一条引用。
 - `rag{status, source_count}` —— RAG 进度。⚠️ 事件类型是 **`rag`**，不是 `source_count`；`source_count` 是它上面的一个**字段**（`orchestrator.go:3552/3555/3570/3580/3616`）。典型 `status` 值：`document_searching`、`searching` 及各类进度状态。
+
+**图片/拒答**：
+- `image_status{status}` —— 图片生成阶段，`status` 为 `optimizing` | `generating`（`orchestrator_image.go:50/90`；前端用它切换「生成中」占位 UI，`artifact` 到达后清除）。
+- `refusal{message}` —— 模型拒答 / 内容过滤 / 额度或审查拦截。**不是 `error`**：前端把消息标成 `refused` 并展示 `message`（`orchestrator.go:3234/3276/3484/3509/4167/4557/4850` 及 `orchestrator_image.go:180`）。
+- `image{url}` —— 仅**私聊**（`/api/private-chat`）管线使用，图片以 `data:` URL 直接内联（`private.go:197`），不属于普通会话生成流。
+
+**深度研究（Deep Research）**：
+- `research_plan{text, summary}` —— 研究计划（标题 + 范围）。
+- `research_task{id, text, status, name}` —— 子问题/任务的状态（`pending` 等）。
+- `research_source{id, url, title, status, summary}` —— 发现的来源及其校验状态（`found` 等）。
+- `research_note{id, text, name}` —— 反思笔记（`name` 为 `round N`）。
+- `research_phase{status}` —— 阶段切换（PLAN/SEARCH/READ/REFLECT/VALIDATE/WRITE）。
+（均定义在 `deep_research.go`，前端在 `conversations.ts` 中聚合为 `ResearchState`。）
 
 **Verify**：`verify_started` / `verify_finding` / `verify_done`（types.go:311-316）。
 
